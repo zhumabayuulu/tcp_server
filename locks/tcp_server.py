@@ -18,8 +18,6 @@ class LockControlServer:
         client_addr = writer.get_extra_info('peername')
         logger.info(f"Новое подключение от {client_addr}")
 
-        device_id = None
-
         try:
             while True:
                 data = await reader.read(1024)
@@ -31,11 +29,8 @@ class LockControlServer:
                     logger.warning(f"Неверный фрейм от {client_addr}: {data.hex()}")
                     continue
 
-                response, reg_device_id, board_instance = await self.process_command(frame, client_addr, writer)
-                if reg_device_id:
-                    device_id = reg_device_id
-                    self.clients[device_id] = (writer, board_instance)
-
+                # Передаём writer в process_command
+                response = await self.process_command(frame, client_addr, writer)
                 if response:
                     writer.write(response)
                     await writer.drain()
@@ -47,29 +42,27 @@ class LockControlServer:
         finally:
             writer.close()
             await writer.wait_closed()
-            if device_id and device_id in self.clients:
-                board = self.clients[device_id][1]
-                del self.clients[device_id]
-                await self.set_board_offline(board)
-                logger.info(f"Клиент {device_id} отключился")
+            for device_id, (w, board) in list(self.clients.items()):
+                if w == writer:
+                    del self.clients[device_id]
+                    await self.set_board_offline(board)
+                    break
 
-    async def process_command(self, frame: dict, client_addr, writer):
+    async def process_command(self, frame: dict, client_addr, writer) -> bytes:
         cmd = frame['cmd']
         board_addr = frame['board_addr']
         data = frame['data']
 
         if cmd == VoungProtocol.CMD_HEARTBEAT:
-            resp = await self.handle_heartbeat(board_addr, data)
-            return resp, None, None
+            return await self.handle_heartbeat(board_addr, data)
         elif cmd == VoungProtocol.CMD_REGISTER:
-            resp, device_id, board = await self.handle_register(board_addr, data, client_addr)
-            return resp, device_id, board
+            return await self.handle_register(board_addr, data, client_addr, writer)
         elif cmd == VoungProtocol.CMD_STATUS_CHANGE:
             await self.handle_status_change(board_addr, data)
-            return None, None, None
+            return None
         else:
             logger.warning(f"Неизвестная команда: 0x{cmd:02X}")
-            return None, None, None
+            return None
 
     async def handle_heartbeat(self, board_addr: int, data: bytes) -> bytes:
         if len(data) >= 8:
@@ -84,9 +77,9 @@ class LockControlServer:
                 logger.error(f"Ошибка при обновлении heartbeat: {e}")
         return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_HEARTBEAT, 0x00)
 
-    async def handle_register(self, board_addr: int, data: bytes, client_addr):
+    async def handle_register(self, board_addr: int, data: bytes, client_addr, writer) -> bytes:
         if len(data) < 10:
-            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF), None, None
+            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF)
 
         device_id = data[:8].decode('ascii', errors='ignore')
         device_type = data[8:10].hex()
@@ -104,15 +97,19 @@ class LockControlServer:
                     'ip_address': client_addr[0] if client_addr else None
                 }
             )
+
             if created:
                 await self.create_locks_for_board(board)
 
+            # Сохраняем соединение с клиентом
+            self.clients[device_id] = (writer, board)
+
             logger.info(f"Устройство {device_id} зарегистрировано")
-            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0x00), device_id, board
+            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0x00)
 
         except Exception as e:
             logger.error(f"Ошибка регистрации устройства {device_id}: {e}")
-            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF), None, None
+            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF)
 
     async def handle_status_change(self, board_addr: int, data: bytes):
         if len(data) < 2:
