@@ -481,6 +481,7 @@ class BoardStatisticsView(APIView):
 
 class DebugClientConnectionsView(APIView):
     def get(self, request):
+        online_boards = LockBoard.objects.filter(is_online=True).values_list('device_id', flat=True)
         return Response({
-            "connected_boards": list(lock_server.clients.keys())
+            "connected_boards": list(online_boards)
         })
