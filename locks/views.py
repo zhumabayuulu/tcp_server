@@ -10,7 +10,13 @@ from .tcp_server import lock_server
 from .protocol import VoungProtocol
 import struct
 import asyncio
+import logging
 
+# Логгерди конфигурациялоо
+logging.basicConfig(level=logging.INFO)
+
+# Логгерди түзүү
+logger = logging.getLogger(__name__)
 
 # Lock Board Views
 class LockBoardListView(generics.ListAPIView):
@@ -113,6 +119,8 @@ class OpenSingleLockView(APIView):
             return Response({'error': 'Плата недоступна'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
+from asgiref.sync import async_to_sync
+
 class OpenAllLocksView(APIView):
     """Открытие всех замков"""
 
@@ -120,14 +128,12 @@ class OpenAllLocksView(APIView):
         board = get_object_or_404(LockBoard, pk=board_id)
 
         try:
-            loop = asyncio.get_event_loop()
-            success = loop.run_until_complete(
-                lock_server.send_command_to_board(
-                    board.device_id,
-                    VoungProtocol.CMD_OPEN_ALL
-                )
+            success = async_to_sync(lock_server.send_command_to_board)(
+                board.device_id,
+                VoungProtocol.CMD_OPEN_ALL
             )
         except Exception as e:
+            logger.error(f"Ошибка отправки команды открытия всех замков: {e}")
             success = False
 
         LockOperation.objects.create(
