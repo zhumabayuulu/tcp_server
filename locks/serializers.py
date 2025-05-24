@@ -27,3 +27,4 @@ class LockOperationSerializer(serializers.ModelSerializer):
     class Meta:
         model = LockOperation
         fields = '__all__'
+

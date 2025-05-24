@@ -478,3 +478,9 @@ class BoardStatisticsView(APIView):
                 'failed': failed_operations
             }
         })
+
+class DebugClientConnectionsView(APIView):
+    def get(self, request):
+        return Response({
+            "connected_boards": list(lock_server.clients.keys())
+        })

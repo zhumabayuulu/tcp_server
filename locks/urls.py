@@ -1,5 +1,6 @@
 from django.urls import path, include
 from . import views
+from .views import DebugClientConnectionsView
 
 urlpatterns = [
     # Board URLs
@@ -26,6 +27,7 @@ urlpatterns = [
     # Operation URLs
     path('api/operations/', views.LockOperationListView.as_view(), name='operation-list'),
     path('api/operations/<int:pk>/', views.LockOperationDetailView.as_view(), name='operation-detail'),
+    path('debug/clients/', DebugClientConnectionsView.as_view()),
 
     # Statistics URLs
     path('api/statistics/', views.BoardStatisticsView.as_view(), name='board-statistics'),
