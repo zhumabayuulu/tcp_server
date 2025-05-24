@@ -1,12 +1,10 @@
 import asyncio
 import logging
 from django.utils import timezone
-from django.db import transaction
-from .models import LockBoard, Lock, LockOperation
+from .models import LockBoard, Lock
 from .protocol import VoungProtocol
 
 logger = logging.getLogger(__name__)
-
 
 class LockControlServer:
     """TCP сервер для управления замками"""
@@ -17,25 +15,27 @@ class LockControlServer:
         self.clients = {}  # device_id -> (writer, board_instance)
 
     async def handle_client(self, reader, writer):
-        """Обработка подключения клиента"""
         client_addr = writer.get_extra_info('peername')
         logger.info(f"Новое подключение от {client_addr}")
 
+        device_id = None
+
         try:
             while True:
-                # Читаем данные
                 data = await reader.read(1024)
                 if not data:
                     break
 
-                # Парсим фрейм
                 frame = VoungProtocol.parse_frame(data)
                 if not frame:
                     logger.warning(f"Неверный фрейм от {client_addr}: {data.hex()}")
                     continue
 
-                # Обрабатываем команду
-                response = await self.process_command(frame, client_addr)
+                response, reg_device_id, board_instance = await self.process_command(frame, client_addr, writer)
+                if reg_device_id:
+                    device_id = reg_device_id
+                    self.clients[device_id] = (writer, board_instance)
+
                 if response:
                     writer.write(response)
                     await writer.drain()
@@ -47,36 +47,33 @@ class LockControlServer:
         finally:
             writer.close()
             await writer.wait_closed()
-            # Убираем клиента из списка активных
-            for device_id, (w, board) in list(self.clients.items()):
-                if w == writer:
-                    del self.clients[device_id]
-                    await self.set_board_offline(board)
-                    break
+            if device_id and device_id in self.clients:
+                board = self.clients[device_id][1]
+                del self.clients[device_id]
+                await self.set_board_offline(board)
+                logger.info(f"Клиент {device_id} отключился")
 
-    async def process_command(self, frame: dict, client_addr) -> bytes:
-        """Обработка команды от устройства"""
+    async def process_command(self, frame: dict, client_addr, writer):
         cmd = frame['cmd']
         board_addr = frame['board_addr']
         data = frame['data']
 
         if cmd == VoungProtocol.CMD_HEARTBEAT:
-            return await self.handle_heartbeat(board_addr, data)
+            resp = await self.handle_heartbeat(board_addr, data)
+            return resp, None, None
         elif cmd == VoungProtocol.CMD_REGISTER:
-            return await self.handle_register(board_addr, data, client_addr)
+            resp, device_id, board = await self.handle_register(board_addr, data, client_addr)
+            return resp, device_id, board
         elif cmd == VoungProtocol.CMD_STATUS_CHANGE:
             await self.handle_status_change(board_addr, data)
-            return None  # Сервер не отвечает на это сообщение
+            return None, None, None
         else:
             logger.warning(f"Неизвестная команда: 0x{cmd:02X}")
-            return None
+            return None, None, None
 
     async def handle_heartbeat(self, board_addr: int, data: bytes) -> bytes:
-        """Обработка heartbeat"""
         if len(data) >= 8:
             device_id = data[:8].decode('ascii', errors='ignore')
-
-            # Обновляем время последнего heartbeat
             try:
                 board = await LockBoard.objects.filter(device_id=device_id).afirst()
                 if board:
@@ -85,20 +82,17 @@ class LockControlServer:
                     await board.asave()
             except Exception as e:
                 logger.error(f"Ошибка при обновлении heartbeat: {e}")
-
         return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_HEARTBEAT, 0x00)
 
-    async def handle_register(self, board_addr: int, data: bytes, client_addr) -> bytes:
-        """Обработка регистрации устройства"""
+    async def handle_register(self, board_addr: int, data: bytes, client_addr):
         if len(data) < 10:
-            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF)
+            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF), None, None
 
         device_id = data[:8].decode('ascii', errors='ignore')
         device_type = data[8:10].hex()
         ccid = data[10:30].decode('ascii', errors='ignore') if len(data) >= 30 else ''
 
         try:
-            # Создаем или обновляем плату
             board, created = await LockBoard.objects.aupdate_or_create(
                 device_id=device_id,
                 defaults={
@@ -110,24 +104,17 @@ class LockControlServer:
                     'ip_address': client_addr[0] if client_addr else None
                 }
             )
-
-            # Создаем замки для новой платы
             if created:
                 await self.create_locks_for_board(board)
 
-            # Сохраняем соединение
-            # В Django async views нужно использовать sync_to_async для writer
-            # self.clients[device_id] = (writer, board) # Это нужно адаптировать
-
             logger.info(f"Устройство {device_id} зарегистрировано")
-            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0x00)
+            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0x00), device_id, board
 
         except Exception as e:
             logger.error(f"Ошибка регистрации устройства {device_id}: {e}")
-            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF)
+            return VoungProtocol.create_response(board_addr, VoungProtocol.CMD_REGISTER, 0xFF), None, None
 
     async def handle_status_change(self, board_addr: int, data: bytes):
-        """Обработка изменения статуса замка"""
         if len(data) < 2:
             return
 
@@ -147,7 +134,6 @@ class LockControlServer:
             logger.error(f"Ошибка при обновлении статуса замка: {e}")
 
     async def create_locks_for_board(self, board: LockBoard):
-        """Создание замков для новой платы"""
         locks_to_create = []
         for channel in range(1, board.total_channels + 1):
             locks_to_create.append(Lock(
@@ -156,17 +142,14 @@ class LockControlServer:
                 name=f"Lock {channel}",
                 status=1  # Закрыт по умолчанию
             ))
-
         await Lock.objects.abulk_create(locks_to_create)
 
     async def set_board_offline(self, board: LockBoard):
-        """Установка платы в оффлайн режим"""
         board.is_online = False
         await board.asave()
         logger.info(f"Плата {board.device_id} отключена")
 
     async def send_command_to_board(self, device_id: str, cmd: int, data: bytes = b'') -> bool:
-        """Отправка команды на плату"""
         if device_id not in self.clients:
             return False
 
@@ -181,15 +164,14 @@ class LockControlServer:
             return False
 
     async def start_server(self):
-        """Запуск TCP сервера"""
         server = await asyncio.start_server(
             self.handle_client,
             self.host,
             self.port
         )
-
         logger.info(f"TCP сервер запущен на {self.host}:{self.port}")
 
         async with server:
             await server.serve_forever()
+
 lock_server = LockControlServer()
